@@ -38,17 +38,31 @@ restore_cache_settings: &restore_cache_settings
 # but may renogotiate with CircleCI and enable larger resource_class
 # options at which point we might want to bump up the Java memory settings
 # and reduce the test parallelism.
-test_settings: &test_settings
+common_settings: &common_settings
   docker:
     - image: *sbt_image
   working_directory: /telemetry-batch-view
   # resource_class: xlarge
 
-early_return_for_forks: &early_return_for_forks
+# CircleCI generally only triggers builds on commits to the main repository,
+# so PRs coming from branches of the main repo simply reference builds for existing commits
+# (CIRCLE_BRANCH=branchname and CIRCLE_PR_NUMBER is unset);
+# The only time PRs will trigger a build is when the PR is referencing a fork
+# (CIRCLE_BRANCH=pull/XXX and CIRCLE_PR_NUMBER=XXX).
+early_return_for_forked_pull_requests: &early_return_for_forked_pull_requests
   name: Early return if this build is from a forked PR
   command: |
     if [ -n "$CIRCLE_PR_NUMBER" ]; then
       echo "Nothing to upload for forked PRs, so marking this step successful"
+      circleci step halt
+    fi
+
+early_return_for_skip_tests: &early_return_for_skip_tests
+  name: Early return if the latest non-merge commit message contains "[skip-tests]"
+  command: |
+    COMMIT_MESSAGE=$(git log --format=%B --no-merges -n 1)
+    if [[ "$COMMIT_MESSAGE" =~ "[skip-tests]" ]]; then
+      echo "Skipping tests due to [skip-tests] flag, so marking this step successful"
       circleci step halt
     fi
 
@@ -61,18 +75,11 @@ version: 2
 jobs:
 
   test:
-    <<: *test_settings
+    <<: *common_settings
     parallelism: 8  # See https://circleci.com/docs/2.0/parallelism-faster-jobs/
     steps:
       - checkout
-      - run:
-          name: Early return if the git commit message contains [skip-tests]
-          command: |
-            COMMIT_MESSAGE=$(git log --format=%B --no-merges -n 1)
-            if [[ "$COMMIT_MESSAGE" =~ "[skip-tests]" ]]; then
-              echo "Skipping tests due to [skip-tests] flag; marking this step successful"
-              circleci step halt
-            fi
+      - run: *early_return_for_skip_tests
       - run: *prep_cache_settings
       - restore_cache: *restore_cache_settings
       - run:
@@ -82,9 +89,11 @@ jobs:
             # listing them as patterns like '*ScalarsTest' suitable for passing to 'sbt testOnly'.
             TEST_FILES=$(find src/test/ -name "*.scala")
             sed -n 's/class \(.*\)  *extends  *FlatSpec.*/*\1/p' $TEST_FILES | sort | uniq > test_patterns.txt
+
             # Use the circleci cli to choose a subset of test patterns to run;
             # the output here will be different for each of the parallel jobs (based on CIRCLE_NODE_* vars).
             TEST_PATTERNS=$(circleci tests split test_patterns.txt | tr -d '\r')
+
             # Now, run just the selected tests.
             echo "Test patterns..."
             echo "$TEST_PATTERNS"
@@ -94,11 +103,23 @@ jobs:
           command: |
             bash <(curl -s https://codecov.io/bash)
 
+  lint:
+    <<: *common_settings
+    steps:
+      - checkout
+      - run: *early_return_for_skip_tests
+      - run: *prep_cache_settings
+      - restore_cache: *restore_cache_settings
+      - run:
+          name: Scalastyle
+          command: |
+            sbt scalastyle test:scalastyle
+
   # Publish to Maven in S3 and assemble an uberjar for the upload_jar step.
   assembly:
-    <<: *test_settings
+    <<: *common_settings
     steps:
-      - run: *early_return_for_forks
+      - run: *early_return_for_forked_pull_requests
       - checkout
       - run:
           name: Publish and Assemble
@@ -116,7 +137,7 @@ jobs:
       - image: *sbt_image
     working_directory: /telemetry-batch-view
     steps:
-      - run: *early_return_for_forks
+      - run: *early_return_for_forked_pull_requests
       - attach_workspace:
           at: /telemetry-batch-view/target
       - run:
@@ -157,7 +178,9 @@ workflows:
     jobs:
       - test
       - assembly
+      # - lint  # enable once https://github.com/mozilla/telemetry-batch-view/pull/442 is merged
       - upload_jar:
           requires:
             - test
             - assembly
+            # - lint  # enable once https://github.com/mozilla/telemetry-batch-view/pull/442 is merged
