@@ -85,18 +85,8 @@ jobs:
       - run:
           name: Scalatest
           command: |
-            # Find the names of all classes extending FlatSpec and collect them into a file
-            # listing them as patterns like '*ScalarsTest' suitable for passing to 'sbt testOnly'.
-            TEST_FILES=$(find src/test/ -name "*.scala")
-            sed -n 's/class \(.*\)  *extends  *FlatSpec.*/*\1/p' $TEST_FILES | sort | uniq > test_patterns.txt
-
-            # Use the circleci cli to choose a subset of test patterns to run;
-            # the output here will be different for each of the parallel jobs (based on CIRCLE_NODE_* vars).
-            TEST_PATTERNS=$(circleci tests split test_patterns.txt | tr -d '\r')
-
-            # Now, run just the selected tests.
-            echo "Test patterns..."
-            echo "$TEST_PATTERNS"
+            TEST_PATTERNS=$(bash .circleci/test-patterns.sh)
+            echo "Test patterns: $TEST_PATTERNS"
             sbt coverage "testOnly $TEST_PATTERNS" coverageReport
       - run:
           name: Submit code coverage data
@@ -115,7 +105,7 @@ jobs:
           command: |
             sbt scalastyle test:scalastyle
 
-  # Publish to Maven in S3 and assemble an uberjar for the upload_jar step.
+  # Publish to Maven in S3 and assemble an uberjar for the deploy step.
   assembly:
     <<: *common_settings
     steps:
@@ -132,40 +122,20 @@ jobs:
             - scala-2.11/telemetry-batch-view-1.1.jar
 
   # Uses a "workspace" to get access to the assembled uberjar from the previous stage.
-  upload_jar:
+  deploy:
     docker:
       - image: *sbt_image
     working_directory: /telemetry-batch-view
     steps:
       - run: *early_return_for_forked_pull_requests
+      - checkout
       - attach_workspace:
           at: /telemetry-batch-view/target
       - run:
           name: Upload
           command: |
-            JAR=target/scala-2.11/telemetry-batch-view-1.1.jar
-            JAR_DIR="$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME"
-            JAR_NAME="$CIRCLE_PROJECT_REPONAME.jar"
-            TXT_NAME="$CIRCLE_PROJECT_REPONAME.txt"
-
-            # The "canonical jar" goes in a subdirectory with the job number so it won't be overwritten.
-            mkdir -p $JAR_DIR/$CIRCLE_BRANCH/$CIRCLE_BUILD_NUM
-            CANONICAL_JAR="$JAR_DIR/$CIRCLE_BRANCH/$CIRCLE_BUILD_NUM/$JAR_NAME"
-            cp $JAR $CANONICAL_JAR
-
-            # We also overwrite the current jar for the branch.
-            echo $CANONICAL_JAR > $TXT_NAME
-            echo $CIRCLE_BUILD_URL > $TXT_NAME
-            cp $JAR "$JAR_DIR/$CIRCLE_BRANCH/$JAR_NAME"
-            cp $TXT_NAME "$JAR_DIR/$CIRCLE_BRANCH/$TXT_NAME"
-
-            # Now upload to S3; see docs for artifact upload tool at https://github.com/travis-ci/artifacts
-            export ARTIFACTS_DEST="$HOME/bin/artifacts"
-            export ARTIFACTS_PERMISSIONS="public-read"
-            export ARTIFACTS_PATHS="$CIRCLE_PROJECT_USERNAME/"
-            export ARTIFACTS_TARGET_PATHS="/$CIRCLE_PROJECT_USERNAME/"
-            curl -sL https://raw.githubusercontent.com/travis-ci/artifacts/master/install | bash
-            $ARTIFACTS_DEST upload
+            export JAR=target/scala-2.11/telemetry-batch-view-1.1.jar
+            bash .circleci/deploy.sh
 
 
 ####################
@@ -179,7 +149,7 @@ workflows:
       - test
       - assembly
       # - lint  # enable once https://github.com/mozilla/telemetry-batch-view/pull/442 is merged
-      - upload_jar:
+      - deploy:
           requires:
             - test
             - assembly
